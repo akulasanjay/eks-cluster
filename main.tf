@@ -257,6 +257,35 @@ resource "aws_iam_role_policy_attachment" "node_AmazonEC2ContainerRegistryReadOn
 }
 
 ########################
+# Pre-destroy cleanup of Kubernetes-managed AWS resources
+########################
+
+# Cleans up LoadBalancer services (ELBs, ENIs, SGs) created by Kubernetes
+# that Terraform doesn't track, which would block VPC deletion.
+resource "null_resource" "k8s_cleanup" {
+  depends_on = [aws_eks_cluster.this]
+
+  triggers = {
+    cluster_name = var.cluster_name
+    region       = var.region
+  }
+
+  provisioner "local-exec" {
+    when       = destroy
+    on_failure = continue
+    command    = <<-EOT
+      aws eks update-kubeconfig --name ${self.triggers.cluster_name} --region ${self.triggers.region}
+      # Delete all LoadBalancer services so the cloud controller removes ELBs/ENIs/SGs
+      kubectl get svc --all-namespaces -o json \
+        | jq -r '.items[] | select(.spec.type=="LoadBalancer") | "\(.metadata.namespace) \(.metadata.name)"' \
+        | xargs -r -L1 bash -c 'kubectl delete svc -n $0 $1'
+      # Wait for ELBs to fully deregister
+      sleep 30
+    EOT
+  }
+}
+
+########################
 # EKS cluster and node group
 ########################
 
@@ -275,6 +304,7 @@ resource "aws_eks_cluster" "this" {
   depends_on = [
     aws_iam_role_policy_attachment.eks_cluster_AmazonEKSClusterPolicy,
     aws_iam_role_policy_attachment.eks_cluster_AmazonEKSServicePolicy,
+    null_resource.k8s_cleanup,
   ]
 
   tags = var.tags
