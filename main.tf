@@ -51,25 +51,25 @@ resource "aws_internet_gateway" "this" {
 }
 
 # Elastic IP for NAT
-# resource "aws_eip" "nat" {
-#   domain = "vpc"
-#
-#   tags = merge(var.tags, {
-#     Name = "${var.cluster_name}-nat-eip"
-#   })
-# }
+resource "aws_eip" "nat" {
+  domain = "vpc"
+
+  tags = merge(var.tags, {
+    Name = "${var.cluster_name}-nat-eip"
+  })
+}
 
 # NAT Gateway in first public subnet
-# resource "aws_nat_gateway" "this" {
-#   allocation_id = aws_eip.nat.id
-#   subnet_id     = aws_subnet.public[0].id
-#
-#   tags = merge(var.tags, {
-#     Name = "${var.cluster_name}-nat"
-#   })
-#
-#   depends_on = [aws_internet_gateway.this]
-# }
+resource "aws_nat_gateway" "this" {
+  allocation_id = aws_eip.nat.id
+  subnet_id     = aws_subnet.public[0].id
+
+  tags = merge(var.tags, {
+    Name = "${var.cluster_name}-nat"
+  })
+
+  depends_on = [aws_internet_gateway.this]
+}
 
 # Public route table
 resource "aws_route_table" "public" {
@@ -96,8 +96,8 @@ resource "aws_route_table" "private" {
   vpc_id = aws_vpc.this.id
 
   route {
-    cidr_block = "0.0.0.0/0"
-    gateway_id = aws_internet_gateway.this.id # NAT gateway commented out, using IGW temporarily
+    cidr_block     = "0.0.0.0/0"
+    nat_gateway_id = aws_nat_gateway.this.id
   }
 
   tags = merge(var.tags, {
@@ -263,8 +263,6 @@ resource "aws_iam_role_policy_attachment" "node_AmazonEC2ContainerRegistryReadOn
 # Cleans up LoadBalancer services (ELBs, ENIs, SGs) created by Kubernetes
 # that Terraform doesn't track, which would block VPC deletion.
 resource "null_resource" "k8s_cleanup" {
-  depends_on = [aws_eks_cluster.this]
-
   triggers = {
     cluster_name = var.cluster_name
     region       = var.region
@@ -304,7 +302,6 @@ resource "aws_eks_cluster" "this" {
   depends_on = [
     aws_iam_role_policy_attachment.eks_cluster_AmazonEKSClusterPolicy,
     aws_iam_role_policy_attachment.eks_cluster_AmazonEKSServicePolicy,
-    null_resource.k8s_cleanup,
   ]
 
   tags = var.tags
@@ -314,7 +311,7 @@ resource "aws_eks_node_group" "this" {
   cluster_name    = aws_eks_cluster.this.name
   node_group_name = "${var.cluster_name}-ng"
   node_role_arn   = aws_iam_role.eks_node_group.arn
-  subnet_ids      = aws_subnet.public[*].id # using public subnets while NAT is commented out
+  subnet_ids      = aws_subnet.private[*].id # private subnets via NAT Gateway
 
   instance_types = [var.node_instance_type]
 
