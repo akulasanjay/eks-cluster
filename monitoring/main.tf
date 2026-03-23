@@ -117,6 +117,7 @@ resource "helm_release" "kube_prometheus_stack" {
   depends_on = [kubernetes_storage_class.gp3]
 }
 
+#### Push to Dev
 ########################
 # Loki Stack
 ########################
