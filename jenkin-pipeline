@@ -1,0 +1,31 @@
+pipeline {
+    agent any
+
+    stages {
+        stage('git checkout') {
+            steps {
+                git branch: 'dev', url: 'https://github.com/akulasanjay/eks-cluster.git'
+            }
+        }
+        
+       stages {
+        stage('AWS CLI TEST') {
+            steps {
+                withCredentials([usernameColonPassword(credentialsId: '6962ce61-1b40-40dc-8819-095ff6bc5e37', variable: passwordVariables: 'AWS_SECRET_ACCESS_KEY', usernameVariable: 'AWS_ACCESS_KEY_ID')]) {
+                    sh '''
+                    aws --version
+                    terraform fmt
+                    terraform init
+                    terraform validate
+                    terraform plan
+                    '''
+                }
+            }
+        } 
+           
+    }
+}
+}
+
+
+

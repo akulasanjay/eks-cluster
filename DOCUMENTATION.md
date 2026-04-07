@@ -1,393 +1,428 @@
-# EKS Cluster Project — Technical Documentation
+# EKS Cluster — Full Project Documentation
 
 ## Table of Contents
-
-1. [Project Overview](#1-project-overview)
-2. [Repository Structure](#2-repository-structure)
-3. [Architecture](#3-architecture)
-4. [Module: backend](#4-module-backend)
-5. [Module: Root — EKS Infrastructure](#5-module-root--eks-infrastructure)
-6. [Module: monitoring](#6-module-monitoring)
-7. [Variables Reference](#7-variables-reference)
-8. [Deployment Guide](#8-deployment-guide)
-9. [Teardown Guide](#9-teardown-guide)
-10. [Known Issues & TODOs](#10-known-issues--todos)
-
----
-
-## 1. Project Overview
-
-This project provisions a fully functional Amazon EKS cluster on AWS using Terraform, including:
-
-- A custom VPC with public and private subnets across two Availability Zones
-- NAT Gateway for private subnet outbound internet access
-- An EKS managed node group running on private subnets
-- A complete observability stack: Prometheus, Alertmanager, Grafana, Loki, and Promtail
-- An AWS Load Balancer Controller to manage ALBs/NLBs from Kubernetes
-- All persistent storage backed by encrypted gp3 EBS volumes
-- Remote Terraform state stored in a versioned, encrypted S3 bucket
-
-**Cloud Provider:** AWS
-**Region:** us-east-1
-**Terraform Version:** >= 1.5.0
+1. [Overview](#overview)
+2. [Architecture](#architecture)
+3. [Project Structure](#project-structure)
+4. [Modules](#modules)
+5. [Inputs](#inputs)
+6. [Outputs](#outputs)
+7. [Getting Started](#getting-started)
+8. [Node Groups](#node-groups)
+9. [Destroy](#destroy)
+10. [Security Considerations](#security-considerations)
+11. [Requirements](#requirements)
 
 ---
 
-## 2. Repository Structure
+## Overview
+
+This Terraform package provisions a production-ready Amazon EKS cluster on AWS. It is fully modular — each concern (networking, IAM, EKS, cleanup, storage) lives in its own reusable module. The root module wires them together and exposes a clean interface via `variables.tf` and `outputs.tf`.
+
+**What gets created:**
+- A VPC with public and private subnets across multiple availability zones
+- Internet Gateway, NAT Gateway, and route tables
+- Security groups for the EKS control plane and worker nodes
+- IAM roles and managed policy attachments for the cluster and node groups
+- An EKS cluster with configurable Kubernetes version
+- One or more managed node groups with configurable instance types and scaling
+- Pre-destroy cleanup automation to drain Kubernetes resources before VPC deletion
+
+---
+
+## Architecture
+
+```
+Internet
+    │
+    ▼
+Internet Gateway
+    │
+    ▼
+┌─────────────────────────────────────────────────────┐
+│  VPC (10.1.0.0/16)                                  │
+│                                                     │
+│  ┌──────────────────┐   ┌──────────────────┐        │
+│  │  Public Subnet 1 │   │  Public Subnet 2 │        │
+│  │  (us-east-1a)    │   │  (us-east-1b)    │        │
+│  │  NAT Gateway     │   │                  │        │
+│  └────────┬─────────┘   └──────────────────┘        │
+│           │ (outbound)                               │
+│  ┌────────▼─────────┐   ┌──────────────────┐        │
+│  │  Private Subnet 1│   │  Private Subnet 2│        │
+│  │  (us-east-1a)    │   │  (us-east-1b)    │        │
+│  │  Worker Nodes    │   │  Worker Nodes    │        │
+│  └──────────────────┘   └──────────────────┘        │
+│                                                     │
+│  ┌──────────────────────────────────────────────┐   │
+│  │  EKS Control Plane (AWS Managed)             │   │
+│  │  - API Server (public + private endpoint)    │   │
+│  │  - etcd, scheduler, controller-manager       │   │
+│  └──────────────────────────────────────────────┘   │
+└─────────────────────────────────────────────────────┘
+
+IAM
+├── eks-cluster-role        → AmazonEKSClusterPolicy, AmazonEKSServicePolicy
+└── eks-nodegroup-role      → AmazonEKSWorkerNodePolicy, AmazonEKS_CNI_Policy,
+                              AmazonEC2ContainerRegistryReadOnly
+
+Security Groups
+├── cluster-sg  (control plane) ← port 443 from nodes + admin CIDR
+└── nodes-sg    (worker nodes)  ← all traffic from cluster-sg + node-to-node
+```
+
+---
+
+## Project Structure
 
 ```
 eks-cluster/
-├── backend/                  # Step 1: Bootstrap S3 remote state bucket
-│   ├── main.tf               # S3 bucket + versioning + encryption
-│   ├── provider.tf           # AWS + random providers, local backend
-│   ├── variables.tf          # region variable
-│   ├── outputs.tf            # Outputs bucket name
-│   └── backend.tf.reference  # Reference snippet for root provider.tf
-│
-├── monitoring/               # Step 3: Observability stack (Helm-based)
-│   ├── main.tf               # gp3 StorageClass, LB Controller, Prometheus, Loki
-│   ├── provider.tf           # AWS, Helm, Kubernetes providers
-│   ├── versions.tf           # Provider version constraints
-│   ├── variables.tf          # cluster_name, region, grafana_admin_password
-│   └── outputs.tf            # Grafana URL command
-│
-├── main.tf                   # Step 2: VPC, subnets, IGW, NAT, SGs, IAM, EKS
-├── provider.tf               # AWS provider, Terraform version, S3 backend (optional)
-├── variables.tf              # All input variable declarations
-├── terraform.tfvars          # Actual variable values
-├── output.tf                 # (reserved)
-├── ec2.tf                    # (reserved)
-├── architecture.drawio       # Architecture diagram (open in draw.io)
-└── README.md                 # Quick-start guide
+├── README.md                      ← quick-start guide
+├── DOCUMENTATION.md               ← this file
+├── versions.tf                    ← Terraform + provider version constraints
+├── provider.tf                    ← AWS provider configuration
+├── main.tf                        ← root module — wires all child modules
+├── variables.tf                   ← all input variables
+├── outputs.tf                     ← all output values
+├── terraform.tfvars               ← your environment values (gitignored)
+├── examples/
+│   └── basic/                     ← complete runnable example
+│       ├── main.tf
+│       ├── variables.tf
+│       └── terraform.tfvars
+└── modules/
+    ├── networking/                ← VPC, subnets, IGW, NAT, route tables, SGs
+    │   ├── main.tf
+    │   ├── variables.tf
+    │   ├── outputs.tf
+    │   └── versions.tf
+    ├── iam/                       ← IAM roles + policy attachments
+    │   ├── main.tf
+    │   ├── variables.tf
+    │   ├── outputs.tf
+    │   └── versions.tf
+    ├── eks/                       ← EKS cluster + managed node groups
+    │   ├── main.tf
+    │   ├── variables.tf
+    │   ├── outputs.tf
+    │   └── versions.tf
+    ├── cleanup/                   ← pre-destroy drain automation
+    │   ├── main.tf
+    │   ├── variables.tf
+    │   └── versions.tf
+    ├── s3/                        ← reusable S3 bucket (versioning, encryption)
+    │   ├── main.tf
+    │   ├── variables.tf
+    │   ├── outputs.tf
+    │   └── versions.tf
+    └── s3-backend/                ← Terraform remote state bootstrap
+        ├── main.tf
+        ├── variables.tf
+        ├── outputs.tf
+        └── provider.tf
 ```
 
 ---
 
-## 3. Architecture
+## Modules
 
-Open `architecture.drawio` at [app.diagrams.net](https://app.diagrams.net) for the visual diagram.
+### `modules/networking`
 
-```
-                          ┌─────────────┐
-                          │   Internet  │
-                          └──────┬──────┘
-                                 │
-                          ┌──────▼──────┐
-                          │Internet GW  │
-                          └──────┬──────┘
-                                 │
-              ┌──────────────────┼──────────────────┐
-              │                                     │
-   ┌──────────▼──────────┐           ┌──────────────▼──────────┐
-   │  Public Subnet AZ1  │           │   Public Subnet AZ2     │
-   │   10.1.1.0/24       │           │   10.1.2.0/24           │
-   │  ┌───────────────┐  │           │  ┌────────────────────┐ │
-   │  │ NAT Gateway   │  │           │  │  AWS Load Balancer │ │
-   │  │ + Elastic IP  │  │           │  │  (Grafana)         │ │
-   │  └───────┬───────┘  │           │  └─────────┬──────────┘ │
-   └──────────┼──────────┘           └────────────┼────────────┘
-              │ outbound                           │
-              ▼                                    ▼
-   ┌──────────────────────────────────────────────────────────────┐
-   │                    Private Subnets (AZ1 + AZ2)              │
-   │                10.1.11.0/24  |  10.1.12.0/24                │
-   │                                                              │
-   │   Worker Node (t3.small)        Worker Node (t3.small)      │
-   │                                                              │
-   │   Namespace: monitoring                                      │
-   │   ┌───────────┐ ┌────────────┐ ┌─────────┐ ┌────────────┐  │
-   │   │Prometheus │ │Alertmanager│ │ Grafana │ │    Loki    │  │
-   │   │ 20Gi gp3  │ │  5Gi gp3  │ │10Gi gp3 │ │ 20Gi gp3  │  │
-   │   └───────────┘ └────────────┘ └────┬────┘ └─────┬──────┘  │
-   │                                     │             │         │
-   │   ┌──────────────────┐    datasources: Prometheus + Loki    │
-   │   │ Promtail DaemonSet│──ships logs──────────────►│         │
-   │   └──────────────────┘                                      │
-   │   ┌──────────────────────────┐                              │
-   │   │ LB Controller (kube-sys) │                              │
-   │   └──────────────────────────┘                              │
-   └──────────────────────────────────────────────────────────────┘
-              │
-   ┌──────────▼──────────────────────────────────────────────────┐
-   │  EKS Control Plane (AWS Managed)                            │
-   │  IAM: eks-cluster-role  |  nodegroup-role                   │
-   └─────────────────────────────────────────────────────────────┘
+Provisions all network infrastructure inside a dedicated VPC.
 
-   S3 Bucket — Terraform Remote State (versioned, AES256 encrypted)
-```
-
----
-
-## 4. Module: `backend/`
-
-Bootstraps the S3 bucket used for Terraform remote state. Must be applied first, before the root module.
-
-### Resources
-
+**Resources created:**
 | Resource | Description |
-|---|---|
-| `aws_s3_bucket` | State bucket with random hex suffix for uniqueness |
-| `aws_s3_bucket_versioning` | Enables versioning for state history and rollback |
-| `aws_s3_bucket_server_side_encryption_configuration` | AES256 encryption at rest |
-| `aws_s3_bucket_public_access_block` | Blocks all public access |
+|----------|-------------|
+| `aws_vpc` | VPC with DNS support and hostnames enabled |
+| `aws_subnet.public` | Public subnets (one per AZ), tagged for ELB use |
+| `aws_subnet.private` | Private subnets (one per AZ), tagged for internal ELB |
+| `aws_internet_gateway` | IGW attached to the VPC |
+| `aws_eip` | Elastic IP for the NAT Gateway |
+| `aws_nat_gateway` | NAT Gateway in the first public subnet |
+| `aws_route_table.public` | Routes 0.0.0.0/0 → IGW |
+| `aws_route_table.private` | Routes 0.0.0.0/0 → NAT Gateway |
+| `aws_security_group.eks_cluster` | Control plane SG — allows egress all, ingress port 443 |
+| `aws_security_group.eks_nodes` | Worker node SG — allows egress all, node-to-node, cluster-to-node |
+| `aws_security_group_rule` (×4) | nodes→cluster:443, node↔node all, cluster→nodes all, admin→cluster:443 |
 
-### Notes
-
-- Uses a **local backend** intentionally — it cannot use the remote backend it is creating
-- `force_destroy = false` prevents accidental deletion of state history
-- After applying, copy the output bucket name into the `backend "s3"` block in the root `provider.tf`
-
----
-
-## 5. Module: Root — EKS Infrastructure
-
-### 5.1 Networking
-
-| Resource | Details |
-|---|---|
-| `aws_vpc` | CIDR `10.1.0.0/16`, DNS support and hostnames enabled |
-| `aws_subnet.public` (×2) | `10.1.1.0/24`, `10.1.2.0/24` — tagged `kubernetes.io/role/elb=1` |
-| `aws_subnet.private` (×2) | `10.1.11.0/24`, `10.1.12.0/24` — tagged `kubernetes.io/role/internal-elb=1` |
-| `aws_internet_gateway` | Attached to VPC; public subnets route through this |
-| `aws_eip.nat` | Elastic IP allocated for the NAT Gateway |
-| `aws_nat_gateway` | Placed in public subnet AZ1; private subnets route outbound traffic through this |
-| `aws_route_table.public` | Routes `0.0.0.0/0` → Internet Gateway |
-| `aws_route_table.private` | Routes `0.0.0.0/0` → NAT Gateway |
-
-### 5.2 Security Groups
-
-| Security Group | Inbound Rules |
-|---|---|
-| `eks_cluster` (control plane) | Port 443 from worker nodes; port 443 from admin CIDR `203.0.113.0/24` |
-| `eks_nodes` (worker nodes) | All traffic from other nodes; all TCP from control plane |
-
-Both security groups allow all outbound traffic.
-
-> **Action required:** Replace `203.0.113.0/24` in `main.tf` with your actual admin IP.
-
-### 5.3 IAM
-
-| Role | Trust | Policies |
-|---|---|---|
-| `eks-cluster-role` | `eks.amazonaws.com` | `AmazonEKSClusterPolicy`, `AmazonEKSServicePolicy` |
-| `nodegroup-role` | `ec2.amazonaws.com` | `AmazonEKSWorkerNodePolicy`, `AmazonEKS_CNI_Policy`, `AmazonEC2ContainerRegistryReadOnly` |
-
-### 5.4 EKS Cluster
-
-| Setting | Value |
-|---|---|
-| Name | `my-eks-cluster` |
-| Subnets | All public + private subnets |
-| Private endpoint | Enabled |
-| Public endpoint | Enabled (open to `0.0.0.0/0` — tighten for production) |
-
-### 5.5 EKS Node Group
-
-| Setting | Value |
-|---|---|
-| Instance type | `t3.small` |
-| Subnets | Private subnets only (outbound via NAT Gateway) |
-| Desired / Min / Max | 2 / 2 / 4 |
-| Max unavailable during update | 1 |
-
-### 5.6 Pre-destroy Cleanup (`null_resource.k8s_cleanup`)
-
-Runs automatically on `terraform destroy`. It:
-
-1. Updates kubeconfig for the cluster
-2. Deletes all Kubernetes `LoadBalancer` services (which create AWS ELBs outside Terraform's control)
-3. Waits 30 seconds for ELBs, ENIs, and security groups to fully deregister
-
-This prevents VPC deletion from failing due to orphaned AWS resources.
+**Outputs:** `vpc_id`, `public_subnet_ids`, `private_subnet_ids`, `cluster_security_group_id`, `nodes_security_group_id`, `nat_gateway_ip`
 
 ---
 
-## 6. Module: `monitoring/`
+### `modules/iam`
 
-A separate Terraform root module. Reads the existing EKS cluster endpoint and credentials from AWS data sources and configures the Helm and Kubernetes providers automatically — no manual kubeconfig needed.
+Creates IAM roles and attaches AWS managed policies required by EKS.
 
-### 6.1 gp3 StorageClass
+**Resources created:**
+| Resource | Description |
+|----------|-------------|
+| `aws_iam_role.eks_cluster` | Cluster role — trusted by `eks.amazonaws.com` |
+| `aws_iam_role.eks_node_group` | Node role — trusted by `ec2.amazonaws.com` |
+| Policy attachment × 2 | `AmazonEKSClusterPolicy`, `AmazonEKSServicePolicy` |
+| Policy attachment × 3 | `AmazonEKSWorkerNodePolicy`, `AmazonEKS_CNI_Policy`, `AmazonEC2ContainerRegistryReadOnly` |
 
-Creates a `gp3` EBS StorageClass and sets it as the cluster default. All monitoring components use this for persistent storage.
+**Outputs:** `cluster_role_arn`, `node_role_arn`, `cluster_policy_attachments`, `node_policy_attachments`
 
-| Setting | Value |
-|---|---|
-| Provisioner | `ebs.csi.aws.com` |
-| Volume binding | `WaitForFirstConsumer` |
-| Reclaim policy | `Delete` |
-| Encryption | Enabled |
-| Volume expansion | Allowed |
+---
 
-### 6.2 AWS Load Balancer Controller
+### `modules/eks`
 
-Deployed via Helm into `kube-system` (chart version `1.7.2`).
+Provisions the EKS cluster and one or more managed node groups.
 
-Enables Kubernetes `Service` (type `LoadBalancer`) and `Ingress` resources to automatically provision AWS ALBs and NLBs.
+**Resources created:**
+| Resource | Description |
+|----------|-------------|
+| `aws_eks_cluster` | EKS control plane with public+private API endpoint |
+| `aws_eks_node_group` (for_each) | One managed node group per entry in `var.node_groups` |
 
-> **Note:** Requires an IAM role with the AWS Load Balancer Controller policy attached via IRSA (IAM Roles for Service Accounts). This is not yet configured in the project — see [Known Issues](#10-known-issues--todos).
+**Key behaviours:**
+- `version` is set on both the cluster and every node group — they always stay in sync
+- Node groups run in **private subnets** only (outbound via NAT)
+- `depends_on` uses IAM policy attachment IDs passed from the IAM module to ensure correct ordering
+- `update_config.max_unavailable = 1` ensures rolling updates
 
-### 6.3 kube-prometheus-stack
+**Outputs:** `cluster_name`, `cluster_endpoint`, `cluster_ca_certificate`, `eks_node_group_arns`
 
-Helm chart: `prometheus-community/kube-prometheus-stack` version `58.2.2`
-Namespace: `monitoring`
+---
 
-| Component | Description | Storage |
-|---|---|---|
-| Prometheus | Scrapes metrics from all nodes, pods, and Kubernetes components | 20 Gi gp3 |
-| Alertmanager | Handles alert routing, grouping, and deduplication | 5 Gi gp3 |
-| Grafana | Visualization dashboards; exposed via internet-facing AWS Load Balancer | 10 Gi gp3 |
+### `modules/cleanup`
 
-Grafana access:
+Runs pre-destroy scripts to remove Kubernetes-managed AWS resources that Terraform doesn't track, which would otherwise block VPC deletion.
 
+**Resources created:**
+| Resource | Description |
+|----------|-------------|
+| `null_resource.drain_and_cleanup` | Deletes all `LoadBalancer` services and PVCs on destroy |
+| `null_resource.deregister_nodes` | Scales all node groups to 0 before cluster deletion |
+
+**Destroy order:**
+1. `drain_and_cleanup` — removes ELBs, ENIs, EBS volumes via kubectl
+2. `deregister_nodes` — scales node groups to 0, waits for EC2 termination
+3. Terraform destroys EKS → IAM → networking in dependency order
+
+---
+
+### `modules/s3`
+
+A reusable, hardened S3 bucket module.
+
+**Resources created:**
+| Resource | Description |
+|----------|-------------|
+| `aws_s3_bucket` | S3 bucket |
+| `aws_s3_bucket_versioning` | Versioning enabled |
+| `aws_s3_bucket_server_side_encryption_configuration` | AES256 encryption |
+| `aws_s3_bucket_public_access_block` | All public access blocked |
+
+**Inputs:** `bucket_name`, `force_destroy`, `tags`  
+**Outputs:** `bucket_name`, `bucket_arn`
+
+---
+
+### `modules/s3-backend`
+
+A standalone root module that bootstraps the Terraform remote state S3 bucket. Uses a `backend "local"` so it manages its own state locally (chicken-and-egg bootstrap).
+
+Wraps `modules/s3` and adds a `random_id` suffix to ensure a globally unique bucket name.
+
+**Usage:**
 ```bash
-# Get the Load Balancer hostname
-kubectl get svc -n monitoring kube-prometheus-stack-grafana \
-  -o jsonpath='{.status.loadBalancer.ingress[0].hostname}'
-
-# Default login
-Username: admin
-Password: changeme123!   # set via var.grafana_admin_password
+terraform -chdir=modules/s3-backend init
+terraform -chdir=modules/s3-backend apply
+# outputs the bucket name to use in your backend config
 ```
 
-### 6.4 Loki Stack
-
-Helm chart: `grafana/loki-stack` version `2.10.2`
-Namespace: `monitoring`
-
-| Component | Description | Storage |
-|---|---|---|
-| Loki | Log aggregation backend | 20 Gi gp3 |
-| Promtail | DaemonSet that ships logs from every node to Loki | — |
-
-Grafana is disabled in this chart (already running from kube-prometheus-stack).
-
-To add Loki as a Grafana datasource:
-- URL: `http://loki:3100`
-
 ---
 
-## 7. Variables Reference
+## Inputs
 
-### Root module (`terraform.tfvars`)
+| Name | Type | Default | Description |
+|------|------|---------|-------------|
+| `region` | `string` | `"us-east-1"` | AWS region to deploy into |
+| `cluster_name` | `string` | `"demo-eks-cluster"` | Name prefix for all resources |
+| `vpc_cidr` | `string` | `"10.0.0.0/16"` | CIDR block for the VPC |
+| `public_subnet_cidrs` | `list(string)` | — | CIDRs for public subnets (one per AZ) |
+| `private_subnet_cidrs` | `list(string)` | — | CIDRs for private subnets (one per AZ) |
+| `kubernetes_version` | `string` | `"1.31"` | Kubernetes version for cluster and node groups |
+| `node_groups` | `map(object)` | — | Map of node groups — see [Node Groups](#node-groups) |
+| `tags` | `map(string)` | `{}` | Tags applied to all resources |
 
-| Variable | Default | Description |
-|---|---|---|
-| `region` | `us-east-1` | AWS region |
-| `cluster_name` | `my-eks-cluster` | EKS cluster name |
-| `vpc_cidr` | `10.1.0.0/16` | VPC CIDR block |
-| `public_subnet_cidrs` | `["10.1.1.0/24", "10.1.2.0/24"]` | Public subnet CIDRs |
-| `private_subnet_cidrs` | `["10.1.11.0/24", "10.1.12.0/24"]` | Private subnet CIDRs |
-| `node_instance_type` | `t3.small` | EC2 instance type for worker nodes |
-| `desired_nodes` | `2` | Desired node count |
-| `min_nodes` | `2` | Minimum node count |
-| `max_nodes` | `4` | Maximum node count |
-| `tags` | `{Environment, Project, Owner}` | Common tags applied to all resources |
-
-### monitoring module
-
-| Variable | Default | Description |
-|---|---|---|
-| `region` | `us-east-1` | AWS region |
-| `cluster_name` | `my-eks-cluster` | EKS cluster name to attach to |
-| `grafana_admin_password` | `changeme123!` | Grafana admin password (sensitive) |
-
----
-
-## 8. Deployment Guide
-
-### Prerequisites
-
-- AWS CLI configured with sufficient permissions
-- Terraform >= 1.5.0
-- `kubectl` installed
-- `helm` installed (optional — Terraform manages Helm)
-
-### Step 1 — Bootstrap Remote State
-
-```bash
-cd backend
-terraform init
-terraform apply
-```
-
-Copy the output bucket name. Then in the root `provider.tf`, uncomment and fill in the `backend "s3"` block:
+### `node_groups` object schema
 
 ```hcl
-backend "s3" {
-  bucket       = "<your-bucket-name>"
-  key          = "eks-cluster/terraform.tfstate"
-  region       = "us-east-1"
-  use_lockfile = true
-  encrypt      = true
+node_groups = {
+  <name> = {
+    instance_types = list(string)   # e.g. ["t3.medium"]
+    desired_nodes  = number         # current desired count
+    min_nodes      = number         # autoscaler minimum
+    max_nodes      = number         # autoscaler maximum
+    labels         = map(string)    # optional k8s node labels
+  }
 }
 ```
 
-### Step 2 — Provision EKS Cluster
+---
 
-```bash
-cd ..
-terraform init
-terraform apply
-```
+## Outputs
 
-This creates the VPC, subnets, NAT Gateway, security groups, IAM roles, and the EKS cluster + node group. Takes ~15 minutes.
-
-### Step 3 — Configure kubectl
-
-```bash
-aws eks update-kubeconfig --name my-eks-cluster --region us-east-1
-kubectl get nodes   # verify nodes are Ready
-```
-
-### Step 4 — Deploy Monitoring Stack
-
-```bash
-cd monitoring
-terraform init
-terraform apply
-```
-
-This deploys the gp3 StorageClass, AWS Load Balancer Controller, Prometheus, Alertmanager, Grafana, Loki, and Promtail. Takes ~5 minutes.
-
-### Step 5 — Access Grafana
-
-```bash
-kubectl get svc -n monitoring kube-prometheus-stack-grafana \
-  -o jsonpath='{.status.loadBalancer.ingress[0].hostname}'
-```
-
-Open the URL in a browser. Login: `admin` / `changeme123!`
+| Name | Description |
+|------|-------------|
+| `cluster_name` | EKS cluster name |
+| `cluster_endpoint` | EKS API server endpoint URL |
+| `cluster_ca_certificate` | Base64-encoded cluster CA certificate |
+| `eks_node_group_arns` | Map of `{ node_group_name => ARN }` |
+| `vpc_id` | VPC ID |
+| `public_subnet_ids` | List of public subnet IDs |
+| `private_subnet_ids` | List of private subnet IDs |
+| `cluster_security_group_id` | Control plane security group ID |
+| `nodes_security_group_id` | Worker nodes security group ID |
+| `nat_gateway_ip` | Public IP of the NAT Gateway |
+| `configure_kubectl` | Ready-to-run `aws eks update-kubeconfig` command |
 
 ---
 
-## 9. Teardown Guide
+## Getting Started
 
-Destroy in reverse order to avoid dependency errors:
+### 1. Bootstrap remote state (first time only)
 
 ```bash
-# 1. Remove monitoring stack first (deletes Helm releases, PVCs, EBS volumes)
-cd monitoring
-terraform destroy
-
-# 2. Destroy the EKS cluster and VPC
-# The k8s_cleanup provisioner auto-deletes LoadBalancer services before VPC removal
-cd ..
-terraform destroy
+terraform -chdir=modules/s3-backend init
+terraform -chdir=modules/s3-backend apply
 ```
 
-> The `backend/` S3 bucket has `force_destroy = false`. Delete it manually from the AWS Console after confirming state is no longer needed.
+Copy the output bucket name into a `backend.tf` in the root:
+
+```hcl
+terraform {
+  backend "s3" {
+    bucket = "<output-bucket-name>"
+    key    = "eks-cluster/terraform.tfstate"
+    region = "us-east-1"
+  }
+}
+```
+
+### 2. Configure your values
+
+Edit `terraform.tfvars`:
+
+```hcl
+region       = "us-east-1"
+cluster_name = "my-eks-cluster"
+
+vpc_cidr             = "10.1.0.0/16"
+public_subnet_cidrs  = ["10.1.1.0/24", "10.1.2.0/24"]
+private_subnet_cidrs = ["10.1.11.0/24", "10.1.12.0/24"]
+
+kubernetes_version = "1.31"
+
+node_groups = {
+  general = {
+    instance_types = ["t3.medium"]
+    desired_nodes  = 2
+    min_nodes      = 2
+    max_nodes      = 4
+    labels         = { role = "general" }
+  }
+}
+
+tags = {
+  Environment = "dev"
+  Project     = "eks-demo"
+}
+```
+
+### 3. Deploy
+
+```bash
+terraform init
+terraform plan
+terraform apply
+```
+
+### 4. Configure kubectl
+
+```bash
+$(terraform output -raw configure_kubectl)
+kubectl get nodes
+```
 
 ---
 
-## 10. Known Issues & TODOs
+## Node Groups
 
-| # | Item | Status | Action |
-|---|---|---|---|
-| 1 | Admin CIDR | ⚠️ Placeholder `203.0.113.0/24` | Replace with your actual IP in `main.tf` |
-| 2 | EKS public endpoint | ⚠️ Open to `0.0.0.0/0` | Restrict `public_access_cidrs` for production |
-| 3 | IRSA for LB Controller | ⚠️ Not configured | Create IAM policy + OIDC provider + service account role for the LB Controller to provision ELBs |
-| 4 | S3 backend | ⚠️ Commented out | Fill in bucket name in `provider.tf` after running `backend/` |
-| 5 | Grafana password | ⚠️ Default value | Override via `var.grafana_admin_password` before applying |
-| 6 | NAT Gateway cost | ℹ️ ~$0.045/hr + data transfer | Destroy when not in use for dev/test environments |
-| 7 | Single NAT Gateway | ℹ️ Only in AZ1 | For high availability, add a NAT Gateway per AZ |
-| 8 | EBS CSI Driver | ⚠️ Must be installed | The gp3 StorageClass requires the EBS CSI driver add-on enabled on the cluster |
+You can define any number of node groups with different instance types, sizes, and labels:
+
+```hcl
+node_groups = {
+  general = {
+    instance_types = ["t3.medium"]
+    desired_nodes  = 2
+    min_nodes      = 2
+    max_nodes      = 4
+    labels         = { role = "general" }
+  }
+  spot = {
+    instance_types = ["t3.large", "t3a.large"]
+    desired_nodes  = 1
+    min_nodes      = 0
+    max_nodes      = 5
+    labels         = { role = "spot" }
+  }
+  gpu = {
+    instance_types = ["g4dn.xlarge"]
+    desired_nodes  = 0
+    min_nodes      = 0
+    max_nodes      = 2
+    labels         = { role = "gpu" }
+  }
+}
+```
+
+Use `nodeSelector` in your pod specs to target a specific group:
+
+```yaml
+spec:
+  nodeSelector:
+    role: general
+```
+
+---
+
+## Destroy
+
+```bash
+terraform destroy
+```
+
+The `cleanup` module automatically runs before destruction:
+1. Deletes all Kubernetes `LoadBalancer` services → removes ELBs/ENIs/SGs
+2. Deletes all PVCs → releases EBS volumes
+3. Scales all node groups to 0 → terminates EC2 instances cleanly
+4. Terraform then destroys EKS cluster, IAM roles, and VPC in order
+
+---
+
+## Security Considerations
+
+| Area | Current Setting | Recommendation |
+|------|----------------|----------------|
+| API server public access | `0.0.0.0/0` | Restrict to your IP/CIDR in `public_access_cidrs` |
+| Admin kubectl access | `203.0.113.0/24` | Change `cluster_api_from_admin` rule to your actual IP |
+| Node subnets | Private only | ✅ Nodes have no public IPs |
+| S3 state bucket | Public access blocked + AES256 | ✅ |
+| IAM roles | Least-privilege managed policies | ✅ |
+
+---
+
+## Requirements
+
+| Name | Version |
+|------|---------|
+| Terraform | `>= 1.5.0` |
+| AWS provider | `~> 5.0` |
+| Null provider | `~> 3.0` |
+| Random provider (s3-backend only) | `~> 3.0` |
+| AWS CLI | Required for cleanup scripts |
+| kubectl | Required for cleanup scripts |
+| jq | Required for cleanup scripts |
